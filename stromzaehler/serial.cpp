@@ -1,15 +1,29 @@
-#include <iostream>
-#include <stdio.h>      // standard input / output functions
-#include <stdlib.h>
-#include <string.h>     // string function definitions
-#include <unistd.h>     // UNIX standard function definitions
-#include <fcntl.h>      // File control definitions
-#include <errno.h>      // Error number definitions
-#include <termios.h>    // POSIX terminal control definitions
-#include <iomanip>		// cout hex into string
+/*
+	serial.cpp
+	----------
+	Serielle Kommunikation mit dem Stromzaehler und Auswertung der SML-Daten.
 
-#include "serial.h"		// eigener Header
-#include "sml_edl21.h"	// Zähler Eigenschaften
+	Aufgaben:
+	  - openConnection(): serielle Schnittstelle oeffnen und konfigurieren
+	  - serialRead():      einen kompletten SML-Frame (Start- bis Endmarker) einlesen
+	  - frameAnalyse():    im Frame nach Zaehlerstand und Leistung suchen und umrechnen
+	  - closeConnection(): Schnittstelle schliessen
+
+	Die Marker, Byte-Laengen und Umrechnungsfaktoren sind in sml_edl21.h definiert.
+*/
+
+#include <iostream>
+#include <stdio.h>      // Standard-Ein-/Ausgabe (printf)
+#include <stdlib.h>     // exit, ...
+#include <string.h>     // String-Funktionen
+#include <unistd.h>     // UNIX-Standardfunktionen (read, close, ...)
+#include <fcntl.h>      // Dateikontroll-Definitionen (open, fcntl)
+#include <errno.h>      // Fehlernummer-Definitionen (errno)
+#include <termios.h>    // POSIX-Terminalsteuerung (serielle Schnittstelle)
+#include <iomanip>		// Formatierung von cout (Hex-Ausgabe)
+
+#include "serial.h"		// eigener Header (Funktionsdeklarationen)
+#include "sml_edl21.h"	// Zaehler-Eigenschaften (Marker, Laengen, Faktoren)
 
 using namespace std;
 using std::string;
@@ -20,8 +34,16 @@ using std::string;
 //memset (&tty, 0, sizeof tty);
 
 /*
-        Öffne  Serielle USB Verbindung
-		
+        Oeffnet die serielle USB-Verbindung zum Stromzaehler.
+
+		Es wird das Geraet /dev/strom mit 9600 Baud, 8 Datenbits, keine Paritaet,
+		1 Stoppbit (8N1) und ohne Flusssteuerung geoeffnet. Kann das Geraet nicht
+		geoeffnet werden, bricht das Programm ab.
+
+		Hinweis: /dev/strom ist ein fester Name (Symlink), der ueber eine udev-Regel
+		an das konkrete USB-Seriell-Geraet gebunden wird. So bleibt der Name auch
+		dann gleich, wenn sich die Reihenfolge der USB-Geraete aendert.
+
 		# Fixieren der USB-Devices
 		# 1. mit "lusb" Vendor ID und Produkt ID herausfinden
 		# 2. ggf. dann noch mit "udevadm info --query=all --attribute-walk --name=/dev/ttyUSB0" oder mit " udevadm info -a -n /dev/ttyUSB0 | grep '{serial}' | head -n1" Seriennummer rausfinden
@@ -75,23 +97,29 @@ int openConnection(int *USBCon)
 	tcflush( *USBCon, TCIFLUSH );
 }
 
+/*
+	Liest byteweise von der seriellen Schnittstelle, bis ein kompletter SML-Frame
+	erkannt wurde. Zuerst wird auf den Startmarker gewartet, anschliessend werden
+	die Daten gesammelt, bis der Endmarker samt Fuellbytes und Pruefsumme folgt.
+	Der fertige Frame wird an frameAnalyse() uebergeben.
+*/
 char serialRead(int *USBCon, float *ptrfWirkarbeitBezugTotal_kWh, float *ptrfLeistung_W, float *ptrfLeistungMin_W, float *ptrfLeistungMax_W)
 {
-	int result = -1;
-	int total_read = 0;
-	int blockSize=1000;
-	char inBuf[1];
-	char blockBuffer[blockSize];
-	const char marker_start[] = MARKER_START;
-	const char marker_end[] = MARKER_END;
+	int result = -1;					// Rueckgabewert von read()
+	int total_read = 0;					// aktuelle Schreibposition im Puffer
+	int blockSize=1000;					// maximale Framegroesse (Puffergroesse)
+	char inBuf[1];						// Einlesepuffer fuer ein einzelnes Byte
+	char blockBuffer[blockSize];		// Puffer fuer den kompletten Frame
+	const char marker_start[] = MARKER_START;	// Startmarker (siehe sml_edl21.h)
+	const char marker_end[] = MARKER_END;		// Endmarker (siehe sml_edl21.h)
 	
-	int endMarkerCnt=0;
+	int endMarkerCnt=0;					// Zaehler fuer die bereits erkannten Endmarker-Bytes
 	
-	bool foundStartMarker = false;
-	bool total_read_reset = false;
-	bool foundEndMarker = false;
+	bool foundStartMarker = false;		// true, sobald der Startmarker vollstaendig erkannt wurde
+	bool total_read_reset = false;		// true, wenn die Suchposition zurueckgesetzt werden muss
+	bool foundEndMarker = false;		// true, sobald der Endmarker vollstaendig erkannt wurde
 	
-	// buffer löschen
+	// Puffer vor dem Einlesen vollstaendig loeschen
 	for (int i=0; i<blockSize; i++)
 		blockBuffer[i]=0;
 	
@@ -177,6 +205,15 @@ char serialRead(int *USBCon, float *ptrfWirkarbeitBezugTotal_kWh, float *ptrfLei
 	return 0;
 }
 
+/*
+	Durchsucht den eingelesenen Frame nach den definierten Markern fuer
+	Zaehlerstand (Wirkarbeit Bezug gesamt) und aktuelle Leistung. Die gefundenen
+	Rohwerte werden gemaess der Byte-Laenge und des Faktors aus sml_edl21.h in
+	physikalische Groessen (kWh bzw. W) umgerechnet und in die uebergebenen Zeiger
+	geschrieben. Zusaetzlich werden Minimal- und Maximalleistung aktualisiert.
+
+	Rueckgabe: 0 wenn beide Werte gefunden wurden, sonst -1.
+*/
 int frameAnalyse(char *frame, int size, float *ptrfWirkarbeitBezugTotal_kWh, float *ptrfLeistung_W, float *ptrfLeistungMin_W, float *ptrfLeistungMax_W)
 {
 	//cout << "Frame-Analyse starten..." << endl;
@@ -277,6 +314,7 @@ int frameAnalyse(char *frame, int size, float *ptrfWirkarbeitBezugTotal_kWh, flo
 		return -1;
 }
 
+// Schliesst die serielle Verbindung anhand des uebergebenen Dateideskriptors
 int closeConnection(int * USBCon)
 {
 	close(*USBCon);
